@@ -1,0 +1,186 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <math.h>
+#include <string.h>
+
+#define FILE_NAME "data.csv"
+#define MAX_ITER 100
+#define ERRCODE 2
+
+float distance(float x1, float y1, float x2, float y2) {
+    return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+}
+
+float** Make2DFloatArray(int rows, int cols) {
+    float** array = (float**)malloc(rows * sizeof(float*));
+    float* data = (float*)malloc(rows * cols * sizeof(float));
+
+    for (int i = 0; i < rows; i++)
+        array[i] = &(data[cols * i]);
+
+    return array;
+}
+
+int readX(float*** p_X, int* p_N_samples, int* p_N_features) {
+    FILE* file = fopen(FILE_NAME, "r");
+    if (file == NULL) {
+        printf("Error: Could not open the file.\n");
+        exit(ERRCODE);
+    }
+
+    int N_samples = 0;
+    char buffer[1024];
+    while (fgets(buffer, sizeof(buffer), file) != NULL) {
+        N_samples++;
+    }
+
+    fseek(file, 0, SEEK_SET);
+
+    int N_features = 0;
+    fgets(buffer, sizeof(buffer), file);
+    char* token = strtok(buffer, ",");
+    while (token != NULL) {
+        N_features++;
+        token = strtok(NULL, ",");
+    }
+
+    fseek(file, 0, SEEK_SET);
+
+    *p_X = Make2DFloatArray(N_samples, N_features);
+
+    for (int i = 0; i < N_samples; i++) {
+        for (int j = 0; j < N_features; j++) {
+            fscanf(file, "%f", &((*p_X)[i][j]));
+            if (j < N_features - 1) {
+                fgetc(file);  // Skip the comma
+            }
+        }
+    }
+
+    fclose(file);
+
+    *p_N_samples = N_samples;
+    *p_N_features = N_features;
+
+    return 0;
+}
+
+void kMeans(float** X, int N_samples, int N_features, int N_clusters, int N_repeat, int** p_labels, float*** p_cluster_centers, int rank, int size) {
+    // Allocate memory for cluster centers
+    float** cluster_centers = Make2DFloatArray(N_clusters, N_features);
+
+    // Allocate memory for cluster assignments
+    int* labels = (int*)malloc(N_samples * sizeof(int));
+
+    // Randomly initialize cluster centers
+    if (rank == 0) {
+        for (int i = 0; i < N_clusters; i++) {
+            int random_idx = rand() % N_samples;
+            for (int j = 0; j < N_features; j++) {
+                cluster_centers[i][j] = X[random_idx][j];
+            }
+        }
+    }
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        // Broadcast the current cluster centers to all processes
+        MPI_Bcast(&(cluster_centers[0][0]), N_clusters * N_features, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+        // Calculate local distances and update local cluster assignments
+        for (int i = rank; i < N_samples; i += size) {
+            float min_dist = distance(X[i][0], X[i][1], cluster_centers[0][0], cluster_centers[0][1]);
+            int min_cluster = 0;
+            for (int k = 1; k < N_clusters; k++) {
+                float dist = distance(X[i][0], X[i][1], cluster_centers[k][0], cluster_centers[k][1]);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    min_cluster = k;
+                }
+            }
+            labels[i] = min_cluster;
+        }
+
+        // Gather all local cluster assignments to process 0
+        MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, labels, N_samples / size, MPI_INT, MPI_COMM_WORLD);
+
+        // Update cluster centers on process 0
+        if (rank == 0) {
+            for (int k = 0; k < N_clusters; k++) {
+                float sum_x = 0.0, sum_y = 0.0;
+                int count = 0;
+                for (int i = 0; i < N_samples; i++) {
+                    if (labels[i] == k) {
+                        sum_x += X[i][0];
+                        sum_y += X[i][1];
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    cluster_centers[k][0] = sum_x / count;
+                    cluster_centers[k][1] = sum_y / count;
+                }
+            }
+        }
+
+        // Broadcast the updated cluster centers from process 0 to all processes
+        MPI_Bcast(&(cluster_centers[0][0]), N_clusters * N_features, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+        // Synchronize processes
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    *p_labels = labels;
+    *p_cluster_centers = cluster_centers;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Initialization
+    int N_samples, N_features, N_clusters = 10, N_repeat = 10;
+    float** X;
+    int* labels;
+    float** cluster_centers;
+
+    double start_read_time, end_read_time, start_kmeans_time, end_kmeans_time, total_time;
+
+    // Read data from CSV file
+    start_read_time = MPI_Wtime();
+    readX(&X, &N_samples, &N_features);
+    end_read_time = MPI_Wtime();
+
+    if (rank == 0) {
+        printf("File reading time: %f seconds\n", end_read_time - start_read_time);
+    }
+
+    // Broadcast the dimensions of the data to all processes
+    MPI_Bcast(&N_samples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&N_features, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Perform k-means clustering
+    start_kmeans_time = MPI_Wtime();
+    kMeans(X, N_samples, N_features, N_clusters, N_repeat, &labels, &cluster_centers, rank, size);
+    end_kmeans_time = MPI_Wtime();
+
+    if (rank == 0) {
+        printf("KMeans execution time: %f seconds\n", end_kmeans_time - start_kmeans_time);
+        printf("Total execution time: %f seconds\n", end_kmeans_time - start_read_time);
+    }
+
+    // Clean up
+    free(X[0]);
+    free(X);
+    free(labels);
+    free(cluster_centers[0]);
+    free(cluster_centers);
+
+    MPI_Finalize();
+
+    return 0;
+}
+
